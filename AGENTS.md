@@ -14,6 +14,9 @@ from the **Cobbleverse** modpack (Modrinth, latest version) into clean, UI-ready
 - `examples/drop_odds.py` is the reference drop calculator: what each Pokémon
   drops when killed and while pastured, how often (Monte-Carlo over the
   stateful selection loop)
+- **(E)** `lang/<locale>.json` — verbatim (byte-exact) copies of the base
+  Cobblemon jar's `assets/cobblemon/lang/*.json` — UI translations for
+  non-minecraft items etc. (keys like `item.cobblemon.relic_coin = "Alter Dukat"`)
 
 ## Commands
 
@@ -222,3 +225,8 @@ Raw drop tables for `data/cobblemon/species/<gen>/<id>.json` →
 - Pasture ≠ kill: the same `drops` table, but pasture is gated by
   `pasture.chance_per_minute` and `pasture.item_blacklist` (from the pack's
   `overrides/config/PastureLoot.json`). Two different output rates from one table.
+- `lang/<locale>.json` are verbatim copies of the base Cobblemon jar's
+  `assets/cobblemon/lang/*` — the only source used (label filter), do not
+  re-serialize; zamega/mega_showdown ship a few of the same files but are
+  intentionally ignored. Item names are `item.cobblemon.<item>`; missing keys
+  (not every item has a translation in every locale) must fall back to the raw id.

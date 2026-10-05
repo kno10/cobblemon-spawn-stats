@@ -27,6 +27,8 @@ Outputs (compact JSON under ./output/<pack>-<version>/):
                                   [{pokemon, weight, conditions?}] + bucket weights
   drops.json                      (D) item drops per pokemon: kill + pasture,
                                   raw drops tables + pastureLoot config/model
+  lang/<locale>.json              (E) verbatim copies of assets/cobblemon/lang/*
+                                  (Cobblemon jar): UI-facing item/content translations
 
 Naming: ids are kept raw as identifiers (no title-casing); display/translated
 names are the UI's job (e.g. from PokeAPI).
@@ -74,6 +76,7 @@ DEFAULT_BUCKET_WEIGHTS = {"common": 1.0, "uncommon": 1.0, "rare": 1.0, "ultra-ra
 POOLS_RE = re.compile(r"^data/cobblemon/spawn_pool_world/[^/]+\.json$")
 SPECIES_RE = re.compile(r"^data/cobblemon/species/\w*/[^/]+\.json$")
 TAG_RE = re.compile(r"^data/([\w-]+)/tags/worldgen/biome/(.+)\.json$")
+LANG_RE = re.compile(r"^assets/cobblemon/lang/[^/]+\.json$")
 PRESET_RE = re.compile(r"^data/cobblemon/spawn_detail_presets/.+\.json$")
 PASTURE_CFG_RE = re.compile(r"^config/PastureLoot\.json$")
 SPAWNER_CFG_RE = re.compile(r"^(?:config|data)/cobblemon/spawning/best-spawner-config\.json$")
@@ -183,6 +186,8 @@ def collect_sources(sources: list[dict]) -> tuple[
         dict[str, tuple[dict, str]],
         dict[str, tuple[dict, str]],
         dict[str, tuple[dict, str]],
+        list[tuple[str, str, dict]],
+        dict[str, tuple[bytes, str]],
         dict[str, dict[str, int]],]:
     pools: dict[str, tuple[dict, str]] = {}
     biome_tags: dict[str, tuple[list[dict], str]] = {}
@@ -190,12 +195,13 @@ def collect_sources(sources: list[dict]) -> tuple[
     spawner_cfgs: dict[str, tuple[dict, str]] = {}
     pasture_cfgs: dict[str, tuple[dict, str]] = {}
     species_files: list[tuple[str, str, dict]] = []  # (path, label, data); visit order = priority
+    langs: dict[str, tuple[bytes, str]] = {}  # path -> (verbatim bytes, source label)
     per_source: dict[str, dict[str, int]] = {}
 
     for source in sorted(sources, key=lambda s: (s["tier"], s["label"])):
         label = source["label"]
         stats = {"pools": 0, "biome_tags": 0, "presets": 0, "spawner_cfg": 0,
-                 "pasture_cfg": 0, "species": 0}
+                 "pasture_cfg": 0, "species": 0, "lang": 0}
 
         def scan(z: zipfile.ZipFile) -> None:
             for name in z.namelist():
@@ -203,7 +209,16 @@ def collect_sources(sources: list[dict]) -> tuple[
                     continue
                 if not (POOLS_RE.match(name) or TAG_RE.match(name) or PRESET_RE.match(name)
                         or SPAWNER_CFG_RE.match(name) or SPECIES_RE.match(name)
-                        or PASTURE_CFG_RE.match(name)):
+                        or PASTURE_CFG_RE.match(name) or LANG_RE.match(name)):
+                    continue
+                if LANG_RE.match(name):
+                    # only the base Cobblemon jar's translations (user-chosen source -
+                    # zamega/mega_showdown ship a few of the same files, but we want the jar's);
+                    # verbatim copy: keep the raw bytes, no decode/re-encode round-trip
+                    if not label.rsplit("/", 1)[-1].startswith("Cobblemon-"):
+                        continue
+                    langs[name] = (z.read(name), label)
+                    stats["lang"] += 1
                     continue
                 try:
                     data = json.loads(z.read(name))
@@ -248,7 +263,7 @@ def collect_sources(sources: list[dict]) -> tuple[
             with zipfile.ZipFile(arc) as z:
                 scan(z)
         per_source[label] = {k: v for k, v in stats.items() if v}
-    return pools, biome_tags, presets, spawner_cfgs, pasture_cfgs, species_files, per_source
+    return pools, biome_tags, presets, spawner_cfgs, pasture_cfgs, species_files, langs, per_source
 
 
 def parse_level_range(value) -> list[int] | None:
@@ -627,7 +642,8 @@ def main() -> None:
     print(f"      {len(sources)} archives, {len(skipped)} locked files skipped (name filter)")
 
     print("[3/5] reading spawn data (only relevant JSON entries, nothing unpacked)")
-    pools, biome_tags, presets, spawner_cfgs, pasture_cfgs, species_files, per_source = collect_sources(
+    (pools, biome_tags, presets, spawner_cfgs, pasture_cfgs, species_files,
+     langs, per_source) = collect_sources(
         sources)
     for s in sources:
         stats = per_source.get(s["label"], {})
@@ -860,6 +876,23 @@ def main() -> None:
         })
     (out_dir / "drops.json").write_text(json.dumps(clean(drops_doc), separators=(",", ":")) + "\n")
 
+    # ---- (E) translations (verbatim copy of assets/cobblemon/lang/*) ------------
+    # NOT processed: byte-exact copies for the UI to use (item names etc.).
+    # Only the base Cobblemon jar's files are used (zamega/mega_showdown ship a
+    # few of the same files, but we want the jar's canonical set).
+    lang_sources: dict[str, int] = {}
+    old_lang_dir = out_dir / "lang"
+    if old_lang_dir.is_dir():  # fully regenerate: no stale locale files
+        for stale in old_lang_dir.glob("*.json"):
+            stale.unlink()
+    if langs:  # skip the section entirely if no source ships lang files
+        old_lang_dir.mkdir(exist_ok=True)
+        for path in sorted(langs):
+            raw, label = langs[path]
+            (old_lang_dir / path.rsplit("/", 1)[-1]).write_bytes(raw)
+            base = label.rsplit("/", 1)[-1]
+            lang_sources[base] = lang_sources.get(base, 0) + 1
+
     # ---- (C) raw spawn weights table ---------------------------------------------
     # location -> bucket -> [{pokemon, weight, conditions?}] — raw weights only;
     # the UI normalizes per world state by filtering rows with `conditions`.
@@ -967,6 +1000,13 @@ def main() -> None:
             "tick_per_minute": (pasture_cfg or {}).get("tick_per_minute"),
             "source": pasture_cfg_source,
         }) if pasture_cfg is not None else None),
+        "translations": (clean({
+            "dir": "lang/",
+            "files": sorted(l.rsplit("/", 1)[-1] for l in langs),
+            "sources": lang_sources,
+            "note": ("verbatim copies of assets/cobblemon/lang/*.json (not processed, byte-exact); "
+                     "UI-facing translations for mod items (drops) and other Cobblemon content"),
+        }) if langs else None),
     }
     (out_dir / "meta.json").write_text(json.dumps(clean(meta), separators=(",", ":")) + "\n")
 
@@ -975,6 +1015,9 @@ def main() -> None:
     print(f"      locations : {len(locations)}")
     print(f"      drops     : {sum(1 for r in drops.values() if r['entries'])} pokemon "
           f"({sum(len(r['entries']) for r in drops.values())} entries) from {len(species_files)} species files")
+    if langs:
+        srcs = ", ".join(f"{v} from {k.split(' :: ')[0]}" for k, v in sorted(lang_sources.items()))
+        print(f"      lang      : {len(langs)} files copied verbatim to lang/ ({srcs})")
     print(f"      unresolved tags: {len(unresolved_tags)}")
     if skipped:
         print(f"      skipped   : {len(skipped)} locked files (use --scan-all-mods to include them)")
