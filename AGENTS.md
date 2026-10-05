@@ -1,14 +1,19 @@
-# Cobbleverse Spawn Data Extractor
+# Cobbleverse Spawn + Drop Data Extractor
 
-A clean Python tool that extracts Cobblemon world-spawn data from the **Cobbleverse**
-modpack (Modrinth, latest version) into clean, UI-ready JSON:
+A clean Python tool that extracts Cobblemon world-spawn **and item-drop** data
+from the **Cobbleverse** modpack (Modrinth, latest version) into clean, UI-ready JSON:
 
 - **(A)** spawn rules per Pokémon → `output/<pack>-<version>/pokemon/<id>.json`
 - **(C)** spawn weights + conditions per location →
   `output/<pack>-<version>/spawn_weights.json` — the single odds source
-- odds for any world state are computed from (C); `examples/spawn_odds.py` is the
+- drops for any world state are computed from (C); `examples/spawn_odds.py` is the
   reference calculator: where a Pokémon appears, when, and how likely per roll
   (event/spawn triggers included)
+- **(D)** item drops per Pokémon (kill + pasture) →
+  `output/<pack>-<version>/drops.json` — the single drop source
+- `examples/drop_odds.py` is the reference drop calculator: what each Pokémon
+  drops when killed and while pastured, how often (Monte-Carlo over the
+  stateful selection loop)
 
 ## Commands
 
@@ -19,6 +24,10 @@ python3 extract_cobbleverse_spawns.py --scan-all-mods     # no name filtering
 
 python3 examples/spawn_odds.py                            # odds for pumpkaboo (default)
 python3 examples/spawn_odds.py zekrom                     # any pokemon / prefix (unown, ...)
+
+python3 examples/drop_odds.py                             # drops for pumpkaboo (default)
+python3 examples/drop_odds.py pikachu                     # any pokemon / prefix
+python3 examples/drop_odds.py gholdengo --trials 500000   # more Monte-Carlo trials
 ```
 
 Stdlib only (Python 3.11+). No `npm`, no `pip install`, no build step.
@@ -41,11 +50,13 @@ Outputs are written to `output/<pack>-<version>/` and are fully regenerated.
 2. tier 1 = locked mod jars (default: name-matched subset, see
    `DEFAULT_JAR_NAME_RE`; `--scan-all-mods` removes the filter).
 
-Same pool path → higher tier wins. The actual Cobbleverse world spawns live in
-`overrides/datapacks/COBBLEVERSE-DP-v31.zip` (1024 pools), which overrides the base
-Cobblemon jar (824 pools). `cobblemon-additions` adds structure pools;
-`mega_showdown`/`zamega` add extras; Hoenn/Johto/Sinnoh/Terralith DPs are opt-in
-tag-only add-ons.
+Same source path → higher tier wins (same rule applies to spawn pools, species files,
+biome tags, and the spawner/pasture configs). The actual Cobbleverse world spawns
+live in `overrides/datapacks/COBBLEVERSE-DP-v31.zip` (1024 pools), which overrides
+the base Cobblemon jar (824 pools). `cobblemon-additions` adds structure pools;
+`mega_showdown` overrides several species drop tables (`overridden_by`); the
+`pastureLoot` mod gates pasture drops via `overrides/config/PastureLoot.json`.
+Hoenn/Johto/Sinnoh/Terralith DPs are opt-in tag-only add-ons.
 
 ### Probability model (per location + per world state, documented in `meta.json`)
 
@@ -115,6 +126,50 @@ pre-normalized — `conditions` make the active row set world-state-dependent):
 - `position` (grounded/surface/submerged) is NOT a condition: it only determines
   the spawn's Y-level/placement within the location and never modifies rolls.
 
+### Drops (item drops on kill + pasture)
+
+Raw drop tables for `data/cobblemon/species/<gen>/<id>.json` →
+`output/<pack>-<version>/drops.json` (`drop_model`, `source_of_truth`, `pasture`,
+`pokemon{}`):
+
+```json
+{
+  "drop_model": "...",
+  "pasture": {"chance_per_minute": 0.15, "tick_per_minute": 1200, "item_blacklist": ["minecraft:chicken", ...]},
+  "pokemon": {
+    "pikachu": {"dex": 25, "name": "Pikachu", "amount": 3,
+      "entries": [
+        {"item": "cobblemon:light_ball", "percentage": 5.0},
+        {"item": "minecraft:feather", "quantity_range": {"min": 2, "max": 4}},
+        {"item": "minecraft:chicken"}
+      ],
+      "overridden_by": ["mods/Cobblemon-....jar"],
+      "source": "mods/mega_showdown-....jar :: data/cobblemon/species/generation1/pikachu.json"}
+  }
+}
+```
+
+- `percentage` defaults to **100** (omitted = guaranteed) and `quantity_range`
+  defaults to **{1,1}** (omitted = exactly 1). Both are omitted when they equal
+  their defaults. `quantity_range` uses the same one-sided `{min,max}` bounds
+  convention as spawn y/x. `min:0` = may drop nothing.
+- `amount` = per-trigger drop budget (number of slots). Selection is stateful:
+  per slot the first (list-order) `percentage`-passing entry is picked, each
+  entry at most once, a slot where nobody passes still spends one budget point.
+  `examples/drop_odds.py` Monte-Carlo simulates this exactly.
+- **pasture vs kill**: same table. kill always triggers. A pasture only rolls
+  when its per-minute check (`chance_per_minute`) passes, and any entry whose
+  item is in `item_blacklist` is never dropped. `pasture.cfg` is the pack's
+  `overrides/config/PastureLoot.json` (pasturLoot mod).
+- **No `probability` field anywhere in `drops.json`** — like `spawn_weights.json`,
+  the raw tables are the single source and `examples/drop_odds.py` is the
+  reference calculator (per-species probability = function of `percentage`,
+  `amount`, `quantity_range`, and pasture `chance_per_minute`/`item_blacklist`).
+- A species file that lacks a `drops` table, or an overriding file that removes it,
+  means "no drops for that Pokémon" (e.g. legendaries often have `drops: null`).
+- `overridden_by` lists the lower-tier source files that lost to `source` for the same
+  species id (see Sources & precedence). `source_of_truth` points at the species files.
+
 ### Biomes & tags
 
 - Cobblemon biome tags (`#cobblemon:is_jungle`, …) resolve **transitively**.
@@ -151,3 +206,19 @@ pre-normalized — `conditions` make the active row set world-state-dependent):
 - Modrinth version resolution: latest release is selected unless `--version` is
   given; the version's `modrinth.index.json` lists every locked file with download
   URL + sha1.
+
+### Drops gotchas
+
+- Drop tables are NOT in the spawn pools — they live in
+  `data/cobblemon/species/<gen>/<id>.json` → `drops`. `spawn_weights.json` says
+  nothing about items; `drops.json` is the only item-drop source.
+- A species with `drops: null`/absent legitimately drops nothing. Don't
+  "fix" it by inferring items from biome or type — absence is the data.
+- `percentage` is a chance **per drop slot**, and there are `amount` slots,
+  so a `5%` entry with `amount: 6` is more likely than 5% per trigger.
+  The `examples/drop_odds.py` Monte-Carlo captures this; don't hand-compute it.
+- `quantity_range` `min:0` means the item is guaranteed to *roll* but *drops
+  nothing* half the time — it is **not** a 0% entry.
+- Pasture ≠ kill: the same `drops` table, but pasture is gated by
+  `pasture.chance_per_minute` and `pasture.item_blacklist` (from the pack's
+  `overrides/config/PastureLoot.json`). Two different output rates from one table.

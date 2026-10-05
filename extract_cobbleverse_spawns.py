@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract Cobblemon world-spawn data from the Cobbleverse modpack (Modrinth).
+"""Extract Cobblemon world-spawn + item-drop data from the Cobbleverse modpack (Modrinth).
 
 Downloads (sha1-verified) and caches under ./data:
   - the Cobbleverse .mrpack                     (data/mrpacks/)
@@ -9,9 +9,11 @@ nothing is ever unpacked to disk.
 
 Read from each archive (higher tier wins on path conflicts):
   - spawn pools   data/cobblemon/spawn_pool_world/<pool>.json        (tier)
+  - species data  data/cobblemon/species/<gen>/<pokemon>.json        (drops; `drops` key)
   - biome tags    data/<ns>/tags/worldgen/biome/**/*.json
   - presets       data/cobblemon/spawn_detail_presets/*.json
   - spawner cfg   config|data/.../spawning/best-spawner-config.json  (bucket weights)
+  - pas cfg     config/PastureLoot.json                              (pasture gate)
 tier 2 = datapacks & override content (lockfile datapacks/, archives inside the mrpack)
 tier 1 = locked mod downloads (resource packs are never data sources)
 
@@ -23,6 +25,8 @@ Outputs (compact JSON under ./output/<pack>-<version>/):
                                   custom spawn zone) with roll probabilities
   spawn_weights.json              (C) raw spawn weights: location -> bucket ->
                                   [{pokemon, weight, conditions?}] + bucket weights
+  drops.json                      (D) item drops per pokemon: kill + pasture,
+                                  raw drops tables + pastureLoot config/model
 
 Naming: ids are kept raw as identifiers (no title-casing); display/translated
 names are the UI's job (e.g. from PokeAPI).
@@ -37,6 +41,16 @@ then normalize over the active rows. The only context that does not affect
 rolls is `position` (grounded / surface / submerged): it only determines the
 spawn's Y-level/placement within the location.
 Entries with weight 0 are trigger/event spawns (not rolled).
+
+Drops (per species, from data/cobblemon/species/<gen>/<id>.json -> `drops`):
+  {amount: N, entries: [{item, percentage? (default 100), quantityRange? (default 1-1)}]}
+Semantics (Cobblemon DropTable + pastureLoot mod, verified against bytecode):
+  - kill trigger: `amount` drop slots; per slot the FIRST (list order) entry whose
+    `percentage`% roll passes is picked (each entry at most once per trigger);
+    a picked entry drops a random quantity in its `quantityRange`.
+  - pasture: same table, but each tethered pokemon only rolls
+    drop_chance_per_minute (pack: 0.15/min) per minute, and pastureLoot's
+    item_blacklist (raw meat/wool/...) excludes matching entries.
 """
 
 from __future__ import annotations
@@ -58,8 +72,10 @@ USER_AGENT = "cobbleverse-spawn-extractor/1.0"
 DEFAULT_BUCKET_WEIGHTS = {"common": 1.0, "uncommon": 1.0, "rare": 1.0, "ultra-rare": 1.0}
 
 POOLS_RE = re.compile(r"^data/cobblemon/spawn_pool_world/[^/]+\.json$")
+SPECIES_RE = re.compile(r"^data/cobblemon/species/\w*/[^/]+\.json$")
 TAG_RE = re.compile(r"^data/([\w-]+)/tags/worldgen/biome/(.+)\.json$")
 PRESET_RE = re.compile(r"^data/cobblemon/spawn_detail_presets/.+\.json$")
+PASTURE_CFG_RE = re.compile(r"^config/PastureLoot\.json$")
 SPAWNER_CFG_RE = re.compile(r"^(?:config|data)/cobblemon/spawning/best-spawner-config\.json$")
 NESTED_ARCHIVE_RE = re.compile(r"^overrides/.+\.(?:jar|zip)$")
 DEFAULT_JAR_NAME_RE = re.compile(
@@ -165,23 +181,29 @@ def collect_sources(sources: list[dict]) -> tuple[
         dict[str, tuple[list[dict], str]],
         dict[str, tuple[dict, str]],
         dict[str, tuple[dict, str]],
+        dict[str, tuple[dict, str]],
+        dict[str, tuple[dict, str]],
         dict[str, dict[str, int]],]:
     pools: dict[str, tuple[dict, str]] = {}
     biome_tags: dict[str, tuple[list[dict], str]] = {}
     presets: dict[str, tuple[dict, str]] = {}
     spawner_cfgs: dict[str, tuple[dict, str]] = {}
+    pasture_cfgs: dict[str, tuple[dict, str]] = {}
+    species_files: list[tuple[str, str, dict]] = []  # (path, label, data); visit order = priority
     per_source: dict[str, dict[str, int]] = {}
 
     for source in sorted(sources, key=lambda s: (s["tier"], s["label"])):
         label = source["label"]
-        stats = {"pools": 0, "biome_tags": 0, "presets": 0, "spawner_cfg": 0}
+        stats = {"pools": 0, "biome_tags": 0, "presets": 0, "spawner_cfg": 0,
+                 "pasture_cfg": 0, "species": 0}
 
         def scan(z: zipfile.ZipFile) -> None:
             for name in z.namelist():
                 if name.endswith("/"):
                     continue
                 if not (POOLS_RE.match(name) or TAG_RE.match(name) or PRESET_RE.match(name)
-                        or SPAWNER_CFG_RE.match(name)):
+                        or SPAWNER_CFG_RE.match(name) or SPECIES_RE.match(name)
+                        or PASTURE_CFG_RE.match(name)):
                     continue
                 try:
                     data = json.loads(z.read(name))
@@ -191,6 +213,9 @@ def collect_sources(sources: list[dict]) -> tuple[
                 if POOLS_RE.match(name):
                     pools[name] = (data, label)
                     stats["pools"] += 1
+                elif SPECIES_RE.match(name):
+                    species_files.append((name, label, data))
+                    stats["species"] += 1
                 elif (m := TAG_RE.match(name)):
                     members = normalize_tag_members(data.get("values"))
                     key = f"{m.group(1)}:{m.group(2)}"
@@ -210,6 +235,9 @@ def collect_sources(sources: list[dict]) -> tuple[
                 elif SPAWNER_CFG_RE.match(name):
                     spawner_cfgs[name] = (data, label)
                     stats["spawner_cfg"] += 1
+                elif PASTURE_CFG_RE.match(name):
+                    pasture_cfgs[name] = (data, label)
+                    stats["pasture_cfg"] += 1
 
         arc = source["archive"]
         if isinstance(arc, tuple):  # (mrpack_path, inner archive name): read in memory
@@ -220,7 +248,7 @@ def collect_sources(sources: list[dict]) -> tuple[
             with zipfile.ZipFile(arc) as z:
                 scan(z)
         per_source[label] = {k: v for k, v in stats.items() if v}
-    return pools, biome_tags, presets, spawner_cfgs, per_source
+    return pools, biome_tags, presets, spawner_cfgs, pasture_cfgs, species_files, per_source
 
 
 def parse_level_range(value) -> list[int] | None:
@@ -400,6 +428,56 @@ def build_spawn_record(entry: dict, pool_path: str, pool: dict, source_label: st
     }
 
 
+def build_drops(species_path: str, data: dict, source_label: str) -> dict:
+    """Normalize a species file's `drops` table into compact rows.
+
+    ItemDropEntry defaults (verified in the Cobblemon jar, Gson-backed POJO):
+    percentage=100, quantity=1 - omitted keys mean those defaults.
+    `quantityRange` bounds become the same {min,max} bounds objects as spawn y/x.
+    """
+    drops = data.get("drops")
+    if not isinstance(drops, dict):
+        raise ValueError("no drops table")
+    entries = []
+    for e in drops.get("entries") or []:
+        if not isinstance(e, dict) or not isinstance(e.get("item"), str):
+            continue
+        row: dict = {"item": e["item"]}
+        pct = e.get("percentage")
+        if isinstance(pct, (int, float)) and float(pct) != 100.0:
+            row["percentage"] = float(pct)
+        qr = e.get("quantityRange")
+        rng = parse_level_range(qr) if qr is not None else None
+        if rng is not None and rng != [1, 1]:
+            bounds: dict = {}
+            if rng[0] is not None:
+                bounds["min"] = rng[0]
+            if rng[1] is not None:
+                bounds["max"] = rng[1]
+            if bounds:
+                row["quantity_range"] = bounds
+        entries.append(row)
+    out: dict = {"name": data.get("name")}
+    amount = drops.get("amount")
+    if isinstance(amount, (int, float)):
+        out["amount"] = int(amount)
+    elif isinstance(amount, str):
+        rng = parse_level_range(amount)
+        if rng:
+            b = {}
+            if rng[0] is not None:
+                b["min"] = rng[0]
+            if rng[1] is not None:
+                b["max"] = rng[1]
+            out["amount"] = b
+    out["entries"] = entries
+    dex = data.get("nationalPokedexNumber")
+    if isinstance(dex, (int, float)):
+        out["dex"] = int(dex)
+    out["source"] = f"{source_label} :: {species_path}"
+    return out
+
+
 # Built-in fallback for vanilla biome tags (exact 1.21.1 lists from mcmeta),
 # since no scanned archive ships `data/minecraft/tags/worldgen/biome/*.json`.
 VANILLA_BIOME_TAGS: dict[str, list[dict]] = {
@@ -549,7 +627,8 @@ def main() -> None:
     print(f"      {len(sources)} archives, {len(skipped)} locked files skipped (name filter)")
 
     print("[3/5] reading spawn data (only relevant JSON entries, nothing unpacked)")
-    pools, biome_tags, presets, spawner_cfgs, per_source = collect_sources(sources)
+    pools, biome_tags, presets, spawner_cfgs, pasture_cfgs, species_files, per_source = collect_sources(
+        sources)
     for s in sources:
         stats = per_source.get(s["label"], {})
         bits = [f"{v} {k}" for k, v in stats.items()]
@@ -577,6 +656,17 @@ def main() -> None:
                 bucket_weights[b["name"]] = b["weight"]
         bucket_weights_source = f"{cfg_path} (from {spawner_cfgs[cfg_path][1]})"
 
+    # ---- pastureLoot config (pack overrides > mod-shipped config) -------------
+    pasture_cfg: dict | None = None
+    pasture_cfg_source = None  # type: ignore[assignment]
+    with zipfile.ZipFile(mrpack_path) as z:
+        if "overrides/config/PastureLoot.json" in z.namelist():
+            pasture_cfg = json.loads(z.read("overrides/config/PastureLoot.json"))
+            pasture_cfg_source = "mrpack: overrides/config/PastureLoot.json"
+    if pasture_cfg is None and pasture_cfgs:
+        cfg_path = sorted(pasture_cfgs)[0]
+        pasture_cfg, pasture_cfg_source = pasture_cfgs[cfg_path]
+
     print("[4/5] resolving biome tags -> locations")
     # ---- normalize spawn records from effective pools -------------------------
     records: list[dict] = []
@@ -593,6 +683,30 @@ def main() -> None:
             rec["pool"] = base_name
             rec["pool_dex"] = int(m.group(1)) if m else None
             records.append(rec)
+
+    # ---- (D) drops tables (species files; last scanned file per id wins) -------
+    by_sid: dict[str, list[tuple[str, str, dict]]] = {}
+    for path, label, data in species_files:
+        sid = path.rsplit("/", 1)[-1].removesuffix(".json")
+        by_sid.setdefault(sid, []).append((path, label, data))
+    drops: dict[str, dict] = {}  # species id -> record
+    overridden_species: dict[str, list[str]] = {}
+    for sid, cands in by_sid.items():
+        rec: dict | None = None
+        for path, label, data in cands:
+            tbl = data.get("drops") if isinstance(data, dict) else None
+            if not isinstance(tbl, dict):
+                rec = None  # an overriding species file without drops disables drops for real
+                continue
+            rec = build_drops(path, data, label)
+        if rec is None or not rec["entries"]:
+            continue
+        if len(cands) > 1:
+            winner = rec["source"].split(" :: ")[0]
+            overridden = sorted({l for _p, l, _d in cands if l != winner})
+            overridden_species[sid] = overridden
+            rec = dict(rec, overridden_by=overridden)
+        drops[sid] = rec
 
     # ---- resolve references -> locations --------------------------------------
     locations: dict[str, dict] = {}  # key -> {kind, entries}
@@ -690,6 +804,8 @@ def main() -> None:
             "spawn_rules": len(locs),
             "biome_count": len({b for l in locs for b in (l["biomes"] or [])}),
             "locations": locs,
+            "drops": ({"amount": drops[ref]["amount"], "entries": drops[ref]["entries"],
+                       "source": drops[ref]["source"]} if drops.get(ref) else None),
             "sources": sorted(p["sources"]),
         }
         (pokemon_dir / f"{sanitize_name(ref)}.json").write_text(
@@ -703,6 +819,46 @@ def main() -> None:
         })
     (out_dir / "pokemon_index.json").write_text(
         json.dumps(clean(index_rows), separators=(",", ":")) + "\n")
+
+    # ---- (D) drops table (canonical per-pokemon item drops) ---------------------
+    drop_model = (
+        "A trigger (a kill, or a pasture minute whose roll passed) grants an `amount`-sized drop budget. "
+        "Then repeat until the budget runs out: in list order, the first entry whose `percentage`% roll passes is "
+        "selected and dropped once (each entry at most once per trigger); a slot where no entry passes still spends "
+        "1 budget point, so an all-failing slot can still happen. `percentage` default is 100 (omitted = guaranteed). "
+        "A selected entry drops a random item count in its `quantity_range` (default {min:1,max:1}; min 0 = sometimes "
+        "drops nothing). "
+        "pasture: the same table rolls for each pasture Pokémon, but only when its per-minute check "
+        "(`pasture.chance_per_minute`) passes, and entries whose item is in `pasture.item_blacklist` never drop."
+    )
+    drops_doc: dict = {
+        "drop_model": drop_model,
+        "source_of_truth": ("data/cobblemon/species/<generation>/<id>.json `drops`; Cobblemon DropTable logic + "
+                            "pastureLoot mod (pasture gating/blacklist) verified against the shipped bytecode"),
+    }
+    if pasture_cfg is not None:
+        drops_doc["pasture"] = clean({
+            "chance_per_minute": pasture_cfg.get("drop_chance_per_minute"),
+            "tick_per_minute": pasture_cfg.get("tick_per_minute"),
+            "item_blacklist": pasture_cfg.get("item_blacklist"),
+            "legacy_flatten_item_quantity": pasture_cfg.get("legacy_flatten_item_quantity"),
+            "source": pasture_cfg_source,
+        })
+    drops_doc["pokemon"] = {}
+    for sid in sorted(drops, key=lambda s: (drops[s].get("dex") is None,
+                                           drops[s].get("dex") or 0, s.lower())):
+        rec = drops[sid]
+        if not rec["entries"]:
+            continue
+        drops_doc["pokemon"][sid] = clean({
+            "dex": rec.get("dex"),
+            "name": rec.get("name"),
+            "amount": rec.get("amount"),
+            "entries": rec["entries"],
+            "overridden_by": rec.get("overridden_by"),
+            "source": rec["source"],
+        })
+    (out_dir / "drops.json").write_text(json.dumps(clean(drops_doc), separators=(",", ":")) + "\n")
 
     # ---- (C) raw spawn weights table ---------------------------------------------
     # location -> bucket -> [{pokemon, weight, conditions?}] — raw weights only;
@@ -751,6 +907,11 @@ def main() -> None:
             "presets": len(presets),
             "unresolved_tags": len(unresolved_tags),
             "disabled_pools": len(disabled_pools),
+            "species_files": len(species_files),
+            "species_ids": len(by_sid),
+            "drops_pokemon": sum(1 for r in drops.values() if r["entries"]),
+            "drops_entries": sum(len(r["entries"]) for r in drops.values()),
+            "overridden_species": len(overridden_species),
         },
         "disabled_pools": disabled_pools,
         "bucket_weights": bucket_weights,
@@ -792,13 +953,28 @@ def main() -> None:
             "weights 0 entries are trigger/event spawns (custom zones, story spawns) and carry no probability",
             "spawn_weights.json holds raw weights (NOT pre-normalized probabilities, since `conditions` make the active row set world-state-dependent): location -> bucket -> [{pokemon, weight, conditions?}]; bucket_weights + formula are in the same file; rows are grouped per distinct condition set (identical duplicates summed); conditions vocabulary: presets / world {{time: day|night|dusk, skylight:{min,max}, can_see_sky, raining, thundering, near_blocks:[ids], base_blocks, y:{min,max}, x:{min,max}, max_light, moon, slime_chunk, lure_min, lure_max, rod, bait, bobber, dimensions}} - bounds are objects {min,max} and may be one-sided (y:{max:48} = at most 48) - / weight_mult ({multiplier, when{{same world keys}}}) / requires_mods / anti_biomes (resolved; spawn excluded there) / anti_structures / anti_world (same world schema)",
             "spawn_weights.json is the single odds source; examples/spawn_odds.py is a reference odds calculator (any pokémon as CLI arg)",
+            "drops.json = item drops per pokemon (kill trigger + pasture, gated by pack pastureLoot config); entries omit percentage (default 100) and quantity_range (default 1), bounds are {min,max}; same species file path resolved across tiers, higher tier wins",
         ],
+        "drop_model": (
+            "See drops.json -> drop_model. In short: a trigger grants an `amount` drop budget; each slot picks the "
+            "first (list order) entry passing its `percentage`% roll (each entry at most once per trigger; a "
+            "all-failing slot still spends 1 budget point); each picked entry drops a count in `quantity_range`. "
+            "Pasture = same table, gated per minute by `pasture.chance_per_minute` and `pasture.item_blacklist`. "
+            "`examples/drop_odds.py` Monte-Carlo simulates the exact loop."
+        ),
+        "pasture": (clean({
+            "chance_per_minute": (pasture_cfg or {}).get("drop_chance_per_minute"),
+            "tick_per_minute": (pasture_cfg or {}).get("tick_per_minute"),
+            "source": pasture_cfg_source,
+        }) if pasture_cfg is not None else None),
     }
     (out_dir / "meta.json").write_text(json.dumps(clean(meta), separators=(",", ":")) + "\n")
 
     print(f"[5/5] wrote outputs to {out_dir}")
     print(f"      pokemon   : {len(by_pokemon)}")
     print(f"      locations : {len(locations)}")
+    print(f"      drops     : {sum(1 for r in drops.values() if r['entries'])} pokemon "
+          f"({sum(len(r['entries']) for r in drops.values())} entries) from {len(species_files)} species files")
     print(f"      unresolved tags: {len(unresolved_tags)}")
     if skipped:
         print(f"      skipped   : {len(skipped)} locked files (use --scan-all-mods to include them)")
