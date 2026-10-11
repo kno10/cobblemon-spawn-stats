@@ -3,7 +3,12 @@
 A clean Python tool that extracts Cobblemon world-spawn **and item-drop** data
 from the **Cobbleverse** modpack (Modrinth, latest version) into clean, UI-ready JSON:
 
-- **(A)** spawn rules per Pokémon → `output/<pack>-<version>/pokemon/<id>.json`
+- **(A)** full species info per Pokémon (raw data of the winning species file:
+  evolutions, learnable moves, drops, behaviour, evYield, baseStats, abilities, ...)
+  **plus its spawn rules** → `output/<pack>-<version>/pokemon/<id>.json`
+  (260 variant ids like `arcanine hisuian` have no species file of their own →
+  they embed the base species data + `base_species` (first id token is the base);
+  34 species have no spawn pool → species-only files)
 - **(C)** spawn weights + conditions per location →
   `output/<pack>-<version>/spawn_weights.json` — the single odds source
 - drops for any world state are computed from (C); `examples/spawn_odds.py` is the
@@ -11,6 +16,8 @@ from the **Cobbleverse** modpack (Modrinth, latest version) into clean, UI-ready
   (event/spawn triggers included)
 - **(D)** item drops per Pokémon (kill + pasture) →
   `output/<pack>-<version>/drops.json` — the single drop source
+  (the `drops` table inside `pokemon/<id>.json` is the raw species-file table;
+  `drops.json` is the normalized, UI-facing table + pasture gate)
 - `examples/drop_odds.py` is the reference drop calculator: what each Pokémon
   drops when killed and while pastured, how often (Monte-Carlo over the
   stateful selection loop)
@@ -195,7 +202,17 @@ Raw drop tables for `data/cobblemon/species/<gen>/<id>.json` →
   write time; absence of a key means "not present". Do not re-add `None` defaults
   or `json.dumps(..., indent=...)` to the output writers.
 - Filenames: `sanitize_name()` is injective (space→`_`, specials→`%XX`).
-- Per-Pokémon files + `pokemon_index.json` (sorted by dex, then id).
+- `pokemon/<id>.json` = raw pass-through of the **winning** species file
+  (`data/cobblemon/species/<gen>/<id>.json`, same higher-tier-wins rule as drops —
+  e.g. `mega_showdown` / COBBLEVERSE-DP override the base jar) + `spawn_rules`
+  (list of one record per spawn rule, incl. resolved biomes/conditions) +
+  `species_source` / `overridden_by` / `sources`. Species-only pokémon have no
+  `spawn_rules`; variant form ids (e.g. `sandslash alolan`,  species fields (e.g. `sandslash alolan`, `basculin striped=blue`,
+  `magikarp_magikarp_jump=...`) have no species file of their own — they embed the
+  base species file (first id token is the base species id) plus a `base_species`
+  flag.
+- Per-Pokémon files + `pokemon_index.json` (sorted by dex, then id; index rows
+  carry `id`, `dex`, `name`, `file`, `rules`, `base?`, `species?`, `biomes`).
 
 ## Gotchas (learned the hard way — see also source comments)
 

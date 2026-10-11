@@ -20,9 +20,12 @@ tier 1 = locked mod downloads (resource packs are never data sources)
 Outputs (compact JSON under ./output/<pack>-<version>/):
   meta.json                       pack/versions/sources/probability model
   pokemon_index.json              one row per pokemon id (id, dex, file, biomes)
-  pokemon/<id>.json               (A) spawn rules for each pokemon
+  pokemon/<id>.json               (A) full species info (raw data of the winning
+                                  species file: evolutions, learnable moves, drops,
+                                  behaviour, evYield, baseStats, abilities, ...) +
+                                  spawn rules for that id (custom spawn zones,
+                                  with roll probabilities)
 
-                                  custom spawn zone) with roll probabilities
   spawn_weights.json              (C) raw spawn weights: location -> bucket ->
                                   [{pokemon, weight, conditions?}] + bucket weights
   drops.json                      (D) item drops per pokemon: kill + pasture,
@@ -758,6 +761,8 @@ def main() -> None:
     out_dir = out_root / f"{PROJECT_SLUG}-{pack['version_number']}"
     pokemon_dir = out_dir / "pokemon"
     pokemon_dir.mkdir(parents=True, exist_ok=True)
+    for stale in sorted(pokemon_dir.glob("*.json")):  # fully regenerate: no stale files
+        stale.unlink()
 
     # ---- (A) per-pokemon files =================================================
     by_pokemon: dict[str, dict] = {}
@@ -780,10 +785,49 @@ def main() -> None:
                 p["locations"].append(rec)
                 p["sources"].add(rec["source"].split(" :: ")[0])
 
+    # ---- (A) full species info (winning species file per id) -------------------
+    # Same winner rule as drops: last candidate in scan order (highest tier wins,
+    # then label) is authoritative. The raw file is passed through unmodified
+    # (clean() only strips nulls / empty containers) - evolutions, moves, drops,
+    # behaviour, evYield, baseStats, abilities, ... are kept as shipped.
+    species_info: dict[str, dict] = {}
+    for sid, cands in by_sid.items():
+        valid = [(p, l, d) for (p, l, d) in cands if isinstance(d, dict)]
+        if not valid:
+            continue
+        path, label, data = valid[-1]
+        entry: dict = {"data": data, "source": f"{label} :: {path}"}
+        if len(valid) > 1:
+            entry["overridden_by"] = sorted({l for _p, l, _d in valid if l != label})
+        species_info[sid] = entry
+
     index_rows = []
-    for ref in sorted(by_pokemon, key=lambda r: (
-            by_pokemon[r]["dex"] is None, by_pokemon[r]["dex"] or 0, r.lower())):
-        p = by_pokemon[ref]
+    all_ids = sorted(set(by_pokemon) | set(species_info))
+
+    def base_species_of(ref: str) -> str | None:
+        """Variant form id (e.g. 'sandslash alolan', 'basculin striped=blue') ->
+        base species id ('sandslash') - Cobblemon ships one species file per species;
+        forms/variants are extra tokens (every spawn-only variant id resolves this way)."""
+        b = re.split(r"[ _]+", ref, 1)[0]
+        return b if (b != ref and b in species_info) else None
+
+    def dex_of(ref: str):
+        sp = species_info.get(ref)
+        if sp is None:
+            sp = species_info.get(base_species_of(ref) or "")
+        if sp:
+            num = sp["data"].get("nationalPokedexNumber")
+            if isinstance(num, (int, float)):
+                return int(num)
+        p = by_pokemon.get(ref)
+        return p["dex"] if p else None
+
+    for ref in sorted(all_ids, key=lambda r: (dex_of(r) is None, dex_of(r) or 0, r.lower())):
+        p = by_pokemon.get(ref, {"dex": None, "locations": [], "sources": set()})
+        sp = species_info.get(ref)
+        base = None
+        if sp is None:  # variant form id has no species file of its own -> base species data
+            sp, base = (species_info[b], b) if (b := base_species_of(ref)) else (None, None)
         seen: set[tuple] = set()
         locs = []
         for rec in p["locations"]:
@@ -814,23 +858,29 @@ def main() -> None:
                 "requires_mods": rec["requires_mods"],
                 "source": rec["source"],
             })
-        doc = {
-            "id": ref,
-            "dex": p["dex"],
-            "spawn_rules": len(locs),
+        doc: dict = {"id": ref, "dex": dex_of(ref)}
+        if sp:  # full species data first (raw pass-through of the winning file)
+            doc.update(sp["data"])
+        doc.update({
+            # (A) on top: spawn rules for this id (list = one record per spawn rule)
+            "spawn_rules": locs,
+            "spawn_rule_count": len(locs),
             "biome_count": len({b for l in locs for b in (l["biomes"] or [])}),
-            "locations": locs,
-            "drops": ({"amount": drops[ref]["amount"], "entries": drops[ref]["entries"],
-                       "source": drops[ref]["source"]} if drops.get(ref) else None),
-            "sources": sorted(p["sources"]),
-        }
+            "base_species": base,
+            "species_source": sp["source"] if sp else None,
+            "overridden_by": sp.get("overridden_by") if sp else None,
+            "sources": sorted(p["sources"] | ({sp["source"].split(" :: ")[0]} if sp else set())),
+        })
         (pokemon_dir / f"{sanitize_name(ref)}.json").write_text(
             json.dumps(clean(doc), separators=(",", ":")) + "\n")
         index_rows.append({
             "id": ref,
-            "dex": p["dex"],
+            "dex": dex_of(ref),
+            "name": sp["data"].get("name") if sp else None,
             "file": f"pokemon/{sanitize_name(ref)}.json",
             "rules": len(locs),
+            "base": base,
+            "species": bool(sp),
             "biomes": sorted({b for l in locs for b in (l["biomes"] or [])}),
         })
     (out_dir / "pokemon_index.json").write_text(
@@ -933,7 +983,10 @@ def main() -> None:
         "game_versions": pack["game_versions"],
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "counts": {
-            "pokemon": len(by_pokemon),
+            "pokemon_files": len(all_ids),
+            "spawn_pokemon": len(by_pokemon),
+            "spawn_only_pokemon": len(set(by_pokemon) - set(species_info)),
+            "species_only_pokemon": len(set(species_info) - set(by_pokemon)),
             "spawn_entries": len(records),
             "locations": len(locations),
             "biome_tags": len(biome_tags),
@@ -979,7 +1032,9 @@ def main() -> None:
             "tier 2 (datapacks: pack overrides, locked datapacks/, and datapacks inside the mrpack) overrides tier 1 (mod jars) for the same pool path",
             "tier-2 locked files under datapacks/ are treated as installed datapacks (override layer)",
             "ids are raw identifiers; no display names are generated",
-            "dex is derived from the pool filename prefix (e.g. 0001_); addon pools without a prefix have dex=null",
+            "dex is derived from the species file (nationalPokedexNumber) with fallback to the pool filename prefix (e.g. 0001_); addon pools without a prefix have dex=null",
+            "pokemon/<id>.json = full species info (raw pass-through of the winning species file: implemented, name, abilities, baseStats, evYield, catchRate, eggCycles, behaviour, drops, moves, evolutions, ...) plus that id's spawn rules; variant form ids (e.g. 'sandslash alolan', 'arcanine hisuian', 'basculin striped=blue') have no species file of their own - they embed the base species file (first id token) and a `base_species` flag; species_source = winning file, overridden_by = losing candidates; drops.json stays the single normalized drop source",
+            "species-only pokémon (no spawn pool) still get a file; their spawn_rules are simply absent",
             "biomes = required members (active in the default install); optional_biomes = members with required:false, i.e. biomes from optional mods (Terralith, Biomes O' Plenty, Wythers, ...) that only exist if those mods are installed; optional biomes/zones are listed in the data, but their pools only matter once those mods are installed",
             "datapacks under overrides/datapacks/extra/ (Hoenn, Johto, Sinnoh, Terralith) are opt-in region add-ons but their tag files are still consulted for tag resolution; treat their biomes as optional",
             "vanilla biome tags (#minecraft:is_*) are resolved from built-in 1.21.1 definitions (mcmeta); unresolved_tags are the rest (mostly #c:* common tags and tags of uninstalled mods) and make a spawn's biome list incomplete",
@@ -1011,7 +1066,8 @@ def main() -> None:
     (out_dir / "meta.json").write_text(json.dumps(clean(meta), separators=(",", ":")) + "\n")
 
     print(f"[5/5] wrote outputs to {out_dir}")
-    print(f"      pokemon   : {len(by_pokemon)}")
+    print(f"      pokemon   : {len(all_ids)} files ({len(by_pokemon)} with spawn rules,"
+          f" {len(species_info)} species, {len(set(by_pokemon) - set(species_info))} spawn-only)")
     print(f"      locations : {len(locations)}")
     print(f"      drops     : {sum(1 for r in drops.values() if r['entries'])} pokemon "
           f"({sum(len(r['entries']) for r in drops.values())} entries) from {len(species_files)} species files")
